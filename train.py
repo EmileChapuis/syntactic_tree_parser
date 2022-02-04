@@ -21,6 +21,7 @@ except:
 
 logger = logging.getLogger(__name__)
 
+
 def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -54,6 +55,7 @@ def load_args_config(saving_path):
 
 
 def train(args, model, train_dataset, val_dataset):
+    device = args.device
     """ Train the model """
     best_loss = 1000000000
     tb_writer = SummaryWriter(args.logs)
@@ -109,7 +111,7 @@ def train(args, model, train_dataset, val_dataset):
                 #    tb_writer.add_scalar('lr', optimizer.get_lr()[0], global_step)
                 if args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     if args.save_steps:  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, val_dataset)
+                        results, _ = evaluate(args, model, val_dataset)
                         for key, value in results.items():
                             tb_writer.add_scalar(f'eval_{key}', value, global_step)
 
@@ -134,9 +136,8 @@ def train(args, model, train_dataset, val_dataset):
     tb_writer.close()
 
 
-
 def evaluate(args, model, eval_dataset):
-    results = {}
+    device = args.device
     eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.train_batch_size, drop_last=True)
 
@@ -194,6 +195,171 @@ def evaluate(args, model, eval_dataset):
     return results
 
 
+def test(args, model, eval_dataset):
+    device = args.device
+    eval_dataloader = DataLoader(eval_dataset, batch_size=args.train_batch_size)
+
+    # Eval!
+    logger.info("***** Running evaluation *****")
+    logger.info("  Num examples = %d", len(eval_dataset))
+    logger.info("  Batch size = %d", args.train_batch_size)
+    eval_loss = 0.0
+    nb_eval_steps = 0
+    all_inputs = []
+    all_head_prev = []
+    all_lbl_prev = []
+    all_head_golden = []
+    all_lbl_golden = []
+    all_attention = []
+    step_eval = 0
+    evaluator = DependencyEvaluator()
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+        step_eval += 1
+        model.eval()
+        with torch.no_grad():
+            inputs = {'input_ids': batch[0].to(device).long(),
+                      'attention_mask': batch[1].to(device).float(),
+                      'postag_ids': batch[3].to(device).long(),
+                      'heads': batch[-2].to(device).long(),
+                      'labels': batch[-1].to(device).long()
+                      }
+
+            loss, head_preds, lbl_preds = model(**inputs)
+            eval_loss += loss
+
+            all_inputs += [batch[0].long()]
+            all_head_prev += [head_preds]
+            all_head_golden += [inputs['heads'].cpu()]
+            all_attention += [inputs['attention_mask'].cpu()]
+            all_lbl_prev += [lbl_preds]
+            all_lbl_golden += [inputs['labels'].cpu()]
+            nb_eval_steps += 1
+
+    eval_loss = eval_loss / nb_eval_steps
+    results = {
+        'loss': eval_loss.item()
+    }
+    logger.info(f"***** Eval Loss {eval_loss} *****")
+
+    all_inputs = torch.cat(all_inputs)[:, 1:]
+    all_head_prev = torch.cat(all_head_prev)[:, 1:]
+    all_head_golden = torch.cat(all_head_golden)[:, 1:]
+    all_attention = torch.cat(all_attention)[:, 1:]
+    all_lbl_prev = torch.cat(all_lbl_prev)[:, 1:]
+    all_lbl_golden = torch.cat(all_lbl_golden).squeeze()[:, 1:]
+    #assert torch.logical_and(all_attention.sum(-1) == (all_head_prev != 0).sum(-1))
+
+    summary = evaluator.eval(all_attention, all_head_prev, all_lbl_prev, all_head_golden, all_lbl_golden)
+    results.update(summary)
+
+    all_results = {
+        'lengths': all_attention.long().sum(-1),
+        'inputs': all_inputs,
+        'head_prev': all_head_prev,
+        'lbl_prev': all_lbl_prev,
+        'head_golden': all_head_golden,
+        'lbl_golden': all_lbl_golden
+    }
+
+    all_results = process_all_results(args, all_results)
+    return results, all_results
+
+
+def process_all_results(dictionary_words, all_results):
+    res = {
+        'inputs': [],
+        'head_prev': [],
+        'lbl_prev': [],
+        'head_golden': [],
+        'lbl_golden': []
+    }
+    N = len(all_results['inputs'])
+    dictionary_words, _, dictionary_labels = load_dictionaries(args.lang, args.corpus)
+    to_words = lambda x: dictionary_words[x]
+    to_labels = lambda x: dictionary_labels[x]
+    for i in range(N):
+        l = all_results['lengths'][i]
+        res['inputs'] += [list(map(to_words, all_results['inputs'][i, :l].tolist()))]
+        res['head_prev'] += [all_results['head_prev'][i, :l].int().tolist()]
+        res['lbl_prev'] += [list(map(to_labels, all_results['lbl_prev'][i, :l].int().tolist()))]
+        res['head_golden'] += [all_results['head_golden'][i, :l].int().tolist()]
+        res['lbl_golden'] += [list(map(to_labels, all_results['lbl_golden'][i, :l].int().tolist()))]
+
+    return res
+
+
+def set_up_args(args):
+    if args.word_embedding_path:
+        args.word_embedding_path = os.path.join(args.word_embedding_path, f'wiki.{args.lang}_{args.corpus}.align.pt')
+
+    dictionary_words, dictionary_postags, dictionary_labels = load_dictionaries(args.lang, args.corpus)
+    args.voc_size = len(dictionary_words)
+    args.nb_pos_tag = len(dictionary_postags)
+    args.nb_lbl = len(dictionary_labels)
+    # Setup logging
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = device
+    args.n_gpu = torch.cuda.device_count()
+
+
+def run_train(args):
+    logger.info("START TRAIN")
+    exp_dir = f'{time.strftime("%m%d-%H%M%S")}'
+    args.logs = os.path.join(args.output_dir, 'logs', exp_dir)
+    args.saving = os.path.join(args.output_dir, 'saving', exp_dir)
+    os.makedirs(args.saving, exist_ok=True)
+
+    set_up_args(args)
+
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                        datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+    logger.info("Process device: %s", args.device)
+
+    # Set seed
+    set_seed(args)
+    config = ConfigBiaffine()
+    save_args_config(args, config)
+
+    model = SyntacticTreeParser(args, config)
+    model.to(args.device)
+
+    train_dataset = load_and_cache_examples(args, 'train')
+    dev_dataset = load_and_cache_examples(args, 'dev')
+    global_step, tr_loss = train(args, model, train_dataset, dev_dataset)
+
+
+def run_test(args):
+    set_up_args(args)
+
+    logger.info("START TEST")
+    exp_dir = args.model_weight_path.split('/')[-2]
+    saving_path = os.path.join(args.output_dir, 'saving', exp_dir)
+
+    results_dir = os.path.join(args.output_dir, 'results', exp_dir)
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Load model with right word embedding
+    config = ConfigBiaffine(**torch.load(os.path.join(saving_path, 'config.json')))
+    args.word_embedding_path = os.path.join(OUT_DIR, f'wiki.{args.lang}_{args.corpus}.align.pt')
+    model = SyntacticTreeParser(args, config)
+    # Warm up and exclude english word emnbedding
+    param = torch.load(args.model_weight_path, map_location=args.device)
+    param = {key: value for key, value in param.items() if not 'word_embdd' in key}
+    model.load_state_dict(param, strict=False)
+    model.to(args.device)
+
+    test_dataset = load_and_cache_examples(args, 'test')
+    results_metric, all_results = test(args, model, test_dataset)
+
+    save_file_path = os.path.join(results_dir, f'{args.lang}_{args.corpus}.json')
+    with open(save_file_path, 'w') as f:
+        json.dump(results_metric, f, indent=6)
+
+    save_file_path = os.path.join(results_dir, f'{args.lang}_{args.corpus}_all_prev.json')
+    with open(save_file_path, 'w') as f:
+        json.dump(all_results, f, indent=6)
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -238,80 +404,8 @@ if __name__ == '__main__':
                         help="Log every X updates steps.")
 
     args = parser.parse_args()
-    exp_dir = f'{time.strftime("%m%d-%H%M%S")}'
-    args.logs = os.path.join(args.output_dir, 'logs', exp_dir)
-    args.saving = os.path.join(args.output_dir, 'saving', exp_dir)
-    os.makedirs(args.saving, exist_ok=True)
-
-    if args.word_embedding_path:
-        args.word_embedding_path = os.path.join(args.word_embedding_path, f'wiki.{args.lang}_{args.corpus}.align.pt')
-
-    dictionary_words, dictionary_postags, dictionary_labels = load_dictionaries(args.lang, args.corpus)
-    args.voc_size = len(dictionary_words)
-    args.nb_pos_tag = len(dictionary_postags)
-    args.nb_lbl = len(dictionary_labels)
-    # Setup logging
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.device = device
-    args.n_gpu = torch.cuda.device_count()
-
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
-    logger.info("Process device: %s", device)
-
-    # Set seed
-    set_seed(args)
-    #tokenizer = BertTokenizer.from_pretrained(args.bert_name, do_lower_case=False)
-    #logger.info('Number of token {}'.format(tokenizer.vocab_size))
-    #args.tokenizer = tokenizer
-    """
-    num_labels – integer, default 2. Number of classes to use when the model is a classification model (sequences/tokens)
-    output_attentions – boolean, default False. Should the model returns attentions weights.
-    output_hidden_states – string, default False. Should the model returns all hidden-states.
-    """
 
     if not args.test:
-        logger.info("START TRAIN")
-        config = ConfigBiaffine()
-        save_args_config(args, config)
-        model = SyntacticTreeParser(args, config)
-        model.to(device)
-
-        train_dataset = load_and_cache_examples(args, 'train')
-        dev_dataset = load_and_cache_examples(args, 'dev')
-        global_step, tr_loss = train(args, model, train_dataset, dev_dataset)
+        run_train(args)
     else:
-        logger.info("START TEST")
-        exp_dir = args.model_weight_path.split('/')[-2]
-        saving_path = os.path.join(args.output_dir, 'saving', exp_dir)
-
-        results_dir = os.path.join(args.output_dir, 'results', exp_dir)
-        os.makedirs(results_dir, exist_ok=True)
-
-        # Load model with right word embedding
-        config = ConfigBiaffine(**torch.load(os.path.join(saving_path, 'config.json')))
-        args.word_embedding_path = os.path.join(OUT_DIR, f'wiki.{args.lang}_{args.corpus}.align.pt')
-        model = SyntacticTreeParser(args, config)
-        # Warm up and exclude english word emnbedding
-        param = torch.load(args.model_weight_path, map_location=device)
-        param = {key: value for key, value in param.items() if not 'word_embdd' in key}
-        model.load_state_dict(param, strict=False)
-        model.to(device)
-
-        test_dataset = load_and_cache_examples(args, 'test')
-        results = evaluate(args, model, test_dataset)
-        print(results)
-        save_file_path = os.path.join(results_dir, f'{args.lang}_{args.corpus}.json')
-        with open(save_file_path, 'w') as f:
-            json.dump(results, f, indent=6)
-
-    logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
-    # Saving
-    logger.info("Saving model checkpoint to %s", args.output_dir)
-    # Save a trained model, configuration and tokenizer using `save_pretrained()`.
-    # They can then be reloaded using `from_pretrained()`
-    #model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
-    # model_to_save.save_pretrained(args.output_dir)
-    #tokenizer.save_pretrained(args.output_dir)
-    # Good practice: save your training arguments together with the trained model
-    #torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
+        run_test(args)
